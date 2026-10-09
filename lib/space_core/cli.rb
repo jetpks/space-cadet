@@ -116,6 +116,11 @@ module Space::Core
     end
 
     def self.run(argv, out = $stdout, err = $stderr)
+      # One-shot 8.x app-dir migration before dispatch — skipped for the pure
+      # help/version queries so they stay side-effect-free (the repo-tender
+      # seam this mirrors does the same).
+      Migration.run(err: err) unless TOP_LEVEL_HELP.include?(argv) || VERSION_REQUEST.include?(argv)
+
       Kernel.exit(call(argv, out, err))
     rescue Interrupt
       err.puts "interrupted"

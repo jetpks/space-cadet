@@ -44,6 +44,17 @@ class HelpTest < Space::CoreTest
     assert_match(/Run `.*--help`/, plain)
   end
 
+  # A host binary sharing this renderer (the architect binary) brands the
+  # header with its own name and version, not the substrate's.
+  def test_host_product_overrides_the_header_brand
+    with_product("architect", "9.0.0") do
+      plain = Space::Core::CLI::Help.call(space_root, pastel: Pastel.new(enabled: false))
+
+      assert_match(/\Aarchitect 9\.0\.0 — /, plain)
+      refute_match(/space-cadet \d/, plain)
+    end
+  end
+
   def test_namespace_does_not_double_the_program_name
     with_program_name("space") do
       plain = Space::Core::CLI::Help.call(core_config_ns, pastel: Pastel.new(enabled: false))
@@ -71,5 +82,14 @@ class HelpTest < Space::CoreTest
     yield
   ensure
     $PROGRAM_NAME = original
+  end
+
+  def with_product(name, version)
+    Space::Core::CLI::Help.product_name = name
+    Space::Core::CLI::Help.product_version = version
+    yield
+  ensure
+    Space::Core::CLI::Help.product_name = nil
+    Space::Core::CLI::Help.product_version = nil
   end
 end
