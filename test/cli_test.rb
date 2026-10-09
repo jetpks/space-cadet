@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-class CLITest < SpaceCadetTest
+class CLITest < Space::CoreTest
   def test_init_creates_xdg_files_and_default_spaces_dir
     setup = temp_env
     env = setup.fetch(:env)
@@ -14,7 +14,7 @@ class CLITest < SpaceCadetTest
       assert_match(/Config:/, out)
       assert_path_exists File.join(env["XDG_CONFIG_HOME"], "space-cadet", "config.yml")
       assert_path_exists File.join(env["XDG_STATE_HOME"], "space-cadet", "state.yml")
-      assert_path_exists File.join(env["HOME"], "src", "spaces")
+      assert_path_exists File.join(env["HOME"], "architect", "spaces")
     end
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
@@ -33,7 +33,7 @@ class CLITest < SpaceCadetTest
       assert_empty err
       assert_match(/Created \d{8}-name-of-space/, out)
       space_id = out[/Created (\d{8}-name-of-space)/, 1]
-      space_path = File.join(env["HOME"], "src", "spaces", space_id)
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
       assert_path_exists space_path
 
       out, = invoke("list")
@@ -42,13 +42,13 @@ class CLITest < SpaceCadetTest
       refute_match(/Status {3,}ID\b/, out)
       assert_match(list_date, out)
       assert_match("Name of Space", out)
-      assert_match("~/src/spaces/#{space_id}", out)
+      assert_match("~/architect/spaces/#{space_id}", out)
       refute_match(env["HOME"], out)
       refute_match(/\e\[/, out)
 
       Dir.chdir(space_path) do
         out, = invoke("path")
-        assert_equal "~/src/spaces/#{space_id}\n", out
+        assert_equal "~/architect/spaces/#{space_id}\n", out
 
         out, = invoke("show")
         assert_match("ID:         #{space_id}", out)
@@ -59,7 +59,7 @@ class CLITest < SpaceCadetTest
 
         out, = invoke("current")
         assert_match(space_id, out)
-        assert_match("~/src/spaces/#{space_id}", out)
+        assert_match("~/architect/spaces/#{space_id}", out)
       end
 
       out, = invoke("show", "name-of-space")
@@ -73,6 +73,124 @@ class CLITest < SpaceCadetTest
     FileUtils.rm_rf(setup[:root]) if setup
   end
 
+  # AC3: `space status` (bare) reports metadata; with no `project` block the
+  # loop block is omitted quietly.
+  def test_space_status_reports_metadata_and_omits_loop_block_without_project
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      out, = invoke("new", "Reportable")
+      space_id = out[/Created (\d{8}-reportable)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+
+      Dir.chdir(space_path) do
+        out, err = invoke("status")
+
+        assert_empty err
+        assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+        assert_match("ID:         #{space_id}", out)
+        assert_match("Status:     active", out)
+        refute_match(/Project status:/, out, "no loop block without a project block")
+      end
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # AC4: each setter form still sets — a lone keyword sets the current space; a
+  # `<space> <keyword>` pair sets the named one.
+  def test_space_status_setter_forms_preserved
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      out, = invoke("new", "Settable")
+      space_id = out[/Created (\d{8}-settable)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+
+      # `<space> <keyword>` form (named)
+      out, err = invoke("status", space_id, "paused")
+      assert_empty err
+      assert_match(/#{space_id} is paused/, out)
+
+      # lone keyword form (current)
+      Dir.chdir(space_path) do
+        out, err = invoke("status", "done")
+        assert_empty err
+        assert_match(/#{space_id} is done/, out)
+      end
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # AC4: a lone NON-keyword arg is a space identifier to REPORT, not a malformed
+  # status (must not raise "Invalid status").
+  def test_space_status_lone_nonkeyword_arg_reports
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      out, = invoke("new", "Named Report")
+      space_id = out[/Created (\d{8}-named-report)/, 1]
+
+      out, err = invoke("status", space_id)
+
+      assert_empty err
+      assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+      assert_match("ID:         #{space_id}", out)
+      refute_match(/Invalid status/, err)
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # AC4b: the bare word `help` shows the command help and exits 0 — it must NOT
+  # set status to "help" (no "Invalid status 'help'") and must NOT report.
+  def test_space_status_help_token_shows_help_and_does_not_set
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      out, = invoke("new", "Helpable")
+      space_id = out[/Created (\d{8}-helpable)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+
+      Dir.chdir(space_path) do
+        out, err = invoke("status", "help")
+
+        assert_empty err
+        assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+        assert_match(/Usage:/, out)
+        refute_match(/Invalid status/, out)
+        refute_match(/ID:/, out, "help must not report")
+
+        # status untouched
+        show, = invoke("show")
+        assert_match("Status:     active", show)
+      end
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # AC4b: dry-cli's -h/--help are sacred too — they render help and exit 0.
+  # dry-cli calls exit() for these, so exercise them via subprocess.
+  def test_space_status_help_flags_show_help_and_exit_zero
+    %w[-h --help].each do |flag|
+      out = IO.popen(["bundle", "exec", "space", "status", flag], err: [:child, :out]) { |f| f.read }
+      status = $?.exitstatus
+      assert_equal 0, status, "space status #{flag} must exit 0"
+      assert_includes out, "Usage:", "space status #{flag} must render help"
+      refute_match(/Invalid status/, out)
+    end
+  end
+
   def test_pwd_current_space_wins_over_recent_or_used_space
     setup = temp_env
     env = setup.fetch(:env)
@@ -83,7 +201,7 @@ class CLITest < SpaceCadetTest
       second_out, = invoke("new", "Qux")
       first_id = first_out[/Created (\d{8}-foo)/, 1]
       second_id = second_out[/Created (\d{8}-qux)/, 1]
-      first_path = File.join(env["HOME"], "src", "spaces", first_id)
+      first_path = File.join(env["HOME"], "architect", "spaces", first_id)
       FileUtils.mkdir_p(File.join(first_path, "repos", "example"))
 
       invoke("use", second_id)
@@ -109,7 +227,7 @@ class CLITest < SpaceCadetTest
       out, = invoke("list", "--color=always")
       assert_match(/\e\[/, out)
       assert_match(/\e\[32mactive\e\[0m/, out)
-      assert_match(/\e\[36m~\/src\/spaces\/\d{8}-color-test\e\[0m/, out)
+      assert_match(/\e\[36m~\/architect\/spaces\/\d{8}-color-test\e\[0m/, out)
 
       out, = invoke("--colors=never", "list")
       refute_match(/\e\[/, out)
@@ -148,7 +266,7 @@ class CLITest < SpaceCadetTest
       assert_match(/function space --wraps space/, File.read(function_path))
       assert_match(/complete -c space/, File.read(completions_path))
       assert_match(/-s r -l repo/, File.read(completions_path))
-      assert_match(/__space_cadet_complete_spaces/, File.read(completions_path))
+      assert_match(/__space_core_complete_spaces/, File.read(completions_path))
 
       out, = invoke("shell", "fish", "install")
       assert_match("Fish integration already installed: #{function_path}", out)
@@ -172,8 +290,8 @@ class CLITest < SpaceCadetTest
     File.write(function_path, "function space\n    echo custom\nend\n")
 
     with_env(env) do
-      error = assert_raises(SpaceCadet::Error) do
-        SpaceCadet::ShellIntegration.install("fish", env: env)
+      error = assert_raises(Space::Core::Error) do
+        Space::Core::ShellIntegration.install("fish", env: env)
       end
       assert_match(/Refusing to overwrite existing fish function/, error.message)
 
@@ -218,7 +336,7 @@ class CLITest < SpaceCadetTest
       invoke("config", "set", "default_organization", "example-org")
       out, = invoke("new", "Repo Space")
       space_id = out[/Created (\d{8}-repo-space)/, 1]
-      space_path = File.join(env["HOME"], "src", "spaces", space_id)
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
       real_space_path = File.realpath(space_path)
 
       Dir.chdir(space_path) do
@@ -226,7 +344,7 @@ class CLITest < SpaceCadetTest
 
         assert_empty err
         assert_match("Added github.com/example-org/example-app", out)
-        assert_match("~/src/spaces/#{space_id}/repos/example-app", out)
+        assert_match("~/architect/spaces/#{space_id}/repos/example-app", out)
         assert_path_exists File.join(space_path, "repos", "example-app", ".git")
 
         assert_equal(
@@ -238,7 +356,7 @@ class CLITest < SpaceCadetTest
           File.read(setup.fetch(:mise_log)).strip
         )
 
-        metadata = YAML.safe_load(File.read(File.join(space_path, ".space.yml")), aliases: false)
+        metadata = YAML.safe_load(File.read(File.join(space_path, "space.yaml")), aliases: false)
         repo = metadata.fetch("repos").first
         assert_equal "github.com/example-org/example-app", repo.fetch("full_name")
         assert_equal "repos/example-app", repo.fetch("path")
@@ -312,7 +430,7 @@ class CLITest < SpaceCadetTest
                        "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log))) do
       out, = invoke("new", "Multi Repo Space")
       space_id = out[/Created (\d{8}-multi-repo-space)/, 1]
-      space_path = File.join(env["HOME"], "src", "spaces", space_id)
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
       real_space_path = File.realpath(space_path)
 
       Dir.chdir(space_path) do
@@ -333,7 +451,7 @@ class CLITest < SpaceCadetTest
           "trust --yes --quiet --cd #{File.join(real_space_path, 'repos', 'beta')}"
         ], File.read(setup.fetch(:mise_log)).split("\n").sort
 
-        metadata = YAML.safe_load(File.read(File.join(space_path, ".space.yml")), aliases: false)
+        metadata = YAML.safe_load(File.read(File.join(space_path, "space.yaml")), aliases: false)
         assert_equal [
           "github.com/example-tools/alpha",
           "github.com/example-tools/beta"
@@ -345,8 +463,8 @@ class CLITest < SpaceCadetTest
     FileUtils.rm_rf(setup[:root]) if setup
   end
 
-  # G5 — D5 proof: new TITLE REPO [REPO...] positional syntax
-  def test_new_with_positional_repos_records_both_in_space_yml
+  # new TITLE -r REPO -r REPO: repeated -r flags accumulate and both clone
+  def test_new_with_repeated_repo_flags_records_both_in_space_yaml
     setup = temp_env
     env = setup.fetch(:env)
     install_fake_git(setup)
@@ -354,11 +472,11 @@ class CLITest < SpaceCadetTest
     with_env(env.merge("PATH" => "#{setup.fetch(:git_bin)}:#{ENV.fetch('PATH')}",
                        "PROJECT_SPACES_GIT_LOG" => setup.fetch(:git_log),
                        "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log))) do
-      out, err = invoke("new", "D5 Space", "example-tools/alpha", "example-tools/beta")
+      out, err = invoke("new", "D5 Space", "-r", "example-tools/alpha", "-r", "example-tools/beta")
 
       assert_empty err
       space_id = out[/Created (\d{8}-d5-space)/, 1]
-      space_path = File.join(env["HOME"], "src", "spaces", space_id)
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
 
       assert_match("Queued example-tools/alpha", out)
       assert_match("Queued example-tools/beta", out)
@@ -367,7 +485,7 @@ class CLITest < SpaceCadetTest
       assert_path_exists File.join(space_path, "repos", "alpha", ".git")
       assert_path_exists File.join(space_path, "repos", "beta", ".git")
 
-      metadata = YAML.safe_load(File.read(File.join(space_path, ".space.yml")), aliases: false)
+      metadata = YAML.safe_load(File.read(File.join(space_path, "space.yaml")), aliases: false)
       assert_equal [
         "github.com/example-tools/alpha",
         "github.com/example-tools/beta"
@@ -387,9 +505,9 @@ class CLITest < SpaceCadetTest
       out, = invoke("new", "Git Space")
 
       space_id = out[/Created (\d{8}-git-space)/, 1]
-      space_path = File.join(env["HOME"], "src", "spaces", space_id)
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
       assert_path_exists File.join(space_path, ".git")
-      assert_equal "repos/\ntmp/\n", File.read(File.join(space_path, ".gitignore"))
+      assert_equal "repos/\ntmp/\nbuild/\n!build/.keep\n", File.read(File.join(space_path, ".gitignore"))
     end
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
@@ -403,9 +521,144 @@ class CLITest < SpaceCadetTest
       out, = invoke("new", "Plain Space", "--no-git")
 
       space_id = out[/Created (\d{8}-plain-space)/, 1]
-      space_path = File.join(env["HOME"], "src", "spaces", space_id)
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
       refute_path_exists File.join(space_path, ".git")
       refute_path_exists File.join(space_path, ".gitignore")
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_new_with_duplicate_repos_reports_error_and_exits_one
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      out = StringIO.new
+      err = StringIO.new
+      code = Space::Core::CLI.call(["new", "Dup Space", "-r", "foo/dup", "-r", "foo/dup"], out, err)
+      assert_equal 1, code
+      assert_match(/Multiple repos resolve to the same destination/, err.string)
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_version_forms_print_to_stdout_and_exit_0
+    [["--version"], ["version"]].each do |argv|
+      out = StringIO.new
+      err = StringIO.new
+      exit_code = Space::Core::CLI.call(argv, out, err)
+      assert_equal 0, exit_code, "#{argv.inspect} should exit 0"
+      assert_equal Space::Core::VERSION, out.string.chomp, "#{argv.inspect} should print VERSION to stdout"
+      assert_empty err.string, "#{argv.inspect} should write nothing to stderr"
+    end
+  end
+
+  def test_help_forms_print_listing_to_stdout_and_exit_0
+    # Space::Core::CLI registry lists space surface groups directly at top level.
+    [[], ["--help"], ["-h"], ["help"]].each do |argv|
+      out = StringIO.new
+      err = StringIO.new
+      exit_code = Space::Core::CLI.call(argv, out, err)
+      assert_equal 0, exit_code, "space #{argv.inspect} should exit 0"
+      assert_match(/\brepo\b.*\[SUBCOMMAND\]/m, out.string, "space #{argv.inspect} should list repo group")
+      assert_match(/\bshell\b.*\[SUBCOMMAND\]/m, out.string, "space #{argv.inspect} should list shell group")
+      assert_empty err.string, "space #{argv.inspect} should write nothing to stderr"
+    end
+  end
+
+  def test_error_output_is_red_when_color_always
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      _out, err = invoke("--color=always", "repo", "add")
+      assert_match(/Usage: space repo add/, err)
+      assert_match(/\e\[31m/, err, "error should be red with --color=always")
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_error_output_is_plain_when_color_never
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      _out, err = invoke("--color=never", "repo", "add")
+      assert_match(/Usage: space repo add/, err)
+      refute_match(/\e\[/, err, "error should have no ANSI with --color=never")
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_color_position_matrix_grouped_subcommand
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      # mid --color=always: color flag between group and subcommand
+      out = StringIO.new; err = StringIO.new
+      code = Space::Core::CLI.call(["repo", "--color=always", "resolve", "foo/a", "foo/b"], out, err)
+      assert_equal 0, code, "mid --color=always should exit 0"
+      assert_empty err.string, "mid --color=always should produce no stderr"
+      assert_match(/\e\[/, out.string, "mid --color=always should produce colored output")
+
+      # mid --color=never: output should be plain
+      out = StringIO.new; err = StringIO.new
+      code = Space::Core::CLI.call(["repo", "--color=never", "resolve", "foo/a", "foo/b"], out, err)
+      assert_equal 0, code, "mid --color=never should exit 0"
+      refute_match(/\e\[/, out.string, "mid --color=never should produce plain output")
+
+      # mid --colors= alias
+      out = StringIO.new; err = StringIO.new
+      code = Space::Core::CLI.call(["repo", "--colors=always", "resolve", "foo/a", "foo/b"], out, err)
+      assert_equal 0, code, "mid --colors=always should exit 0"
+      assert_match(/\e\[/, out.string, "mid --colors=always alias should produce colored output")
+
+      # trailing --color=always
+      out = StringIO.new; err = StringIO.new
+      code = Space::Core::CLI.call(["repo", "resolve", "foo/a", "foo/b", "--color=always"], out, err)
+      assert_equal 0, code, "trailing --color=always should exit 0"
+      assert_match(/\e\[/, out.string, "trailing --color=always should produce colored output")
+
+      # leading --color=always (regression: existing behavior must be preserved)
+      out = StringIO.new; err = StringIO.new
+      code = Space::Core::CLI.call(["--color=always", "repo", "resolve", "foo/a", "foo/b"], out, err)
+      assert_equal 0, code, "leading --color=always should exit 0"
+      assert_match(/\e\[/, out.string, "leading --color=always should produce colored output")
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_color_position_mid_second_group
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      out, err = invoke("config", "--color=always", "show")
+      assert_empty err
+      assert_match(/default_provider/, out)
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_color_position_non_grouped_unregressed
+    setup = temp_env
+    env = setup.fetch(:env)
+
+    with_env(env) do
+      invoke("init")
+      invoke("new", "Color List Test")
+      out, err = invoke("--color=always", "list")
+      assert_empty err
+      assert_match(/\e\[/, out)
     end
   ensure
     FileUtils.rm_rf(setup[:root]) if setup

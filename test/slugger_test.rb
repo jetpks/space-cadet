@@ -2,10 +2,10 @@
 
 require_relative "test_helper"
 
-class SluggerTest < SpaceCadetTest
+class SluggerTest < Space::CoreTest
   def test_slugifies_titles
-    assert_equal "name-of-space", SpaceCadet::Slugger.slug("Name of Space")
-    assert_equal "rx-1234-fix-profile-loading", SpaceCadet::Slugger.slug("RX-1234: Fix profile loading")
-    assert_equal "space", SpaceCadet::Slugger.slug("!!!")
+    assert_equal "name-of-space", Space::Core::Slugger.slug("Name of Space")
+    assert_equal "rx-1234-fix-profile-loading", Space::Core::Slugger.slug("RX-1234: Fix profile loading")
+    assert_equal "space", Space::Core::Slugger.slug("!!!")
   end
 end
