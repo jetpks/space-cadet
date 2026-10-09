@@ -1,39 +1,50 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "async/condition"
+require "async/task"
 
-class SpaceStoreTest < SpaceCadetTest
+class SpaceStoreTest < Space::CoreTest
   def test_create_space_with_date_prefixed_unique_id_and_structure
     setup = temp_env
     store = build_store(env: setup.fetch(:env))
 
-    space = store.create("Name of Space")
-    duplicate = store.create("Name of Space")
+    result = store.create("Name of Space")
+    duplicate_result = store.create("Name of Space")
+
+    assert result.success?
+    assert duplicate_result.success?
+    space = result.value!
+    duplicate = duplicate_result.value!
 
     assert_equal "20260531-name-of-space", space.id
     assert_equal "20260531-name-of-space-2", duplicate.id
     assert_nil store.state.current_space
     assert_equal ["20260531-name-of-space-2", "20260531-name-of-space"], store.state.recent
 
-    assert_path_exists space.path.join(".space.yml")
+    assert_path_exists space.path.join("space.yaml")
     assert_path_exists space.path.join("README.md")
     assert_path_exists space.path.join("repos")
     assert_path_exists space.path.join("notes")
-    assert_path_exists space.path.join("artifacts")
+    assert_path_exists space.path.join("architecture")
     assert_path_exists space.path.join("tmp")
+    assert_path_exists space.path.join("build")
+    assert_path_exists space.path.join("build", ".keep")
     assert_path_exists space.path.join(".git")
-    assert_equal "repos/\ntmp/\n", space.path.join(".gitignore").read
+    assert_equal "repos/\ntmp/\nbuild/\n!build/.keep\n", space.path.join(".gitignore").read
     assert_includes space.path.join("README.md").read, "## Organization"
+    assert_includes space.path.join("README.md").read, "build/"
     assert_includes space.path.join("README.md").read, "`repos/` contains cloned Git repositories"
     assert_includes space.path.join("README.md").read, "Use it instead of `/tmp` or"
 
-    metadata = YAML.safe_load(space.path.join(".space.yml").read, aliases: false)
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
     assert_equal "Name of Space", metadata.fetch("title")
     assert_equal "active", metadata.fetch("status")
     assert_equal [], metadata.fetch("repos")
     assert_equal [], metadata.fetch("notes")
     assert_equal [], metadata.fetch("tickets")
     assert_equal [], metadata.fetch("tags")
+    assert_equal 2, metadata.fetch("version")
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
   end
@@ -47,7 +58,7 @@ class SpaceStoreTest < SpaceCadetTest
       "GIT_AUTHOR_EMAIL" => "cadet@example.com",
       "GIT_COMMITTER_NAME" => "Space Cadet",
       "GIT_COMMITTER_EMAIL" => "cadet@example.com"
-    ) { store.create("Committed Space") }
+    ) { store.create("Committed Space") }.value!
 
     head = system("git", "-C", space.path.to_s, "rev-parse", "--verify", "HEAD",
                   out: File::NULL, err: File::NULL)
@@ -60,7 +71,7 @@ class SpaceStoreTest < SpaceCadetTest
     setup = temp_env
     store = build_store(env: setup.fetch(:env))
 
-    space = store.create("No Git Space", git: false)
+    space = store.create("No Git Space", git: false).value!
 
     refute_path_exists space.path.join(".git")
     refute_path_exists space.path.join(".gitignore")
@@ -94,14 +105,16 @@ class SpaceStoreTest < SpaceCadetTest
     setup = temp_env
     store = build_store(env: setup.fetch(:env))
 
-    first = store.create("Name of Space")
+    first = store.create("Name of Space").value!
     store.create("Other Work")
 
-    assert_equal first.id, store.find("20260531-name-of-space").id
-    assert_equal first.id, store.find("name-of-space").id
-    assert_equal first.id, store.find("20260531-name").id
+    assert_equal first.id, store.find("20260531-name-of-space").value!.id
+    assert_equal first.id, store.find("name-of-space").value!.id
+    assert_equal first.id, store.find("20260531-name").value!.id
 
-    assert_raises(SpaceCadet::AmbiguousSpaceError) { store.find("20260531") }
+    result = store.find("20260531")
+    assert result.failure?
+    assert_kind_of Space::Core::AmbiguousSpaceError, result.failure
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
   end
@@ -110,16 +123,32 @@ class SpaceStoreTest < SpaceCadetTest
     setup = temp_env
     store = build_store(env: setup.fetch(:env))
 
-    first = store.create("First Space")
-    second = store.create("Second Space")
+    first = store.create("First Space").value!
+    second = store.create("Second Space").value!
     store.state.touch_current(second.id)
     nested = first.path.join("repos", "example")
     FileUtils.mkdir_p(nested)
 
-    assert_equal first.id, store.find(nil, from: nested).id
-    assert_equal first.id, store.current(from: nested).id
-    assert_nil store.current_from_pwd(from: setup.fetch(:root))
-    assert_raises(SpaceCadet::CurrentSpaceMissingError) { store.find(nil, from: setup.fetch(:root)) }
+    assert_equal first.id, store.find(nil, from: nested).value!.id
+    assert_equal first.id, store.current(from: nested).value!.id
+    assert store.current_from_pwd(from: setup.fetch(:root)).none?
+    result = store.find(nil, from: setup.fetch(:root))
+    assert result.failure?
+    assert_kind_of Space::Core::CurrentSpaceMissingError, result.failure
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_current_from_pwd_returns_maybe
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+
+    assert store.current_from_pwd(from: setup.fetch(:root)).none?
+
+    space = store.create("A Space").value!
+    result = store.current_from_pwd(from: space.path)
+    assert result.some?
+    assert_equal space.id, result.value!.id
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
   end
@@ -127,13 +156,13 @@ class SpaceStoreTest < SpaceCadetTest
   def test_status_validation_and_update
     setup = temp_env
     store = build_store(env: setup.fetch(:env))
-    space = store.create("Name of Space")
+    space = store.create("Name of Space").value!
 
     space.update_status("done", now: fixed_time)
-    reloaded = SpaceCadet::Space.load(space.path)
+    reloaded = Space::Core::Space.load(space.path)
 
     assert_equal "done", reloaded.status
-    assert_raises(SpaceCadet::InvalidStatusError) { reloaded.update_status("unknown") }
+    assert_raises(Space::Core::InvalidStatusError) { reloaded.update_status("unknown") }
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
   end
@@ -141,20 +170,27 @@ class SpaceStoreTest < SpaceCadetTest
   def test_add_repos_limits_concurrent_clones
     setup = temp_env
     store = build_store(env: setup.fetch(:env))
-    space = store.create("Concurrent Clones")
-    git_client = TrackingGitClient.new
+    space = store.create("Concurrent Clones").value!
+    limit = Space::Core::SpaceStore::MAX_CONCURRENT_CLONES
+    fake_scm = TrackingSCM.new(target: limit)
     mise_client = TrackingMiseClient.new
 
-    results = store.add_repos_to(
+    add_result = store.add_repos_to(
       space,
       (1..6).map { |index| "example-tools/repo-#{index}" },
-      git_client: git_client,
+      scm: fake_scm,
       mise_client: mise_client
     )
 
+    assert add_result.success?, -> { "add_repos_to failed: #{add_result.failure}" }
+    results = add_result.value!
     assert_equal 6, results.length
-    assert_equal SpaceCadet::SpaceStore::MAX_CONCURRENT_CLONES, git_client.max_active
-    assert_operator git_client.clone_count, :>, git_client.max_active
+    # Async::Semaphore only bounds concurrency from above (see Semaphore#wait/#release) —
+    # it never guarantees the bound is reached. TrackingSCM#clone rendezvouses at `target`
+    # simultaneously-active clones before any may proceed, so reaching exactly `limit`
+    # here is forced by construction, not a scheduling race (was flaky under the old
+    # sleep-timed fake: a clone could finish before the fifth started).
+    assert_equal limit, fake_scm.max_active
     assert_equal 6, mise_client.trust_count
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
@@ -165,53 +201,229 @@ class SpaceStoreTest < SpaceCadetTest
     evergreen = Pathname.new(setup.fetch(:root)).join("evergreen")
     FileUtils.mkdir_p(evergreen.join("github.com", "example-tools", "present", ".git"))
 
-    config = SpaceCadet::Config.new(
+    config = Space::Core::Config.new(
       env: setup.fetch(:env),
-      data: { "version" => 1, "spaces_dir" => "~/src/spaces", "evergreen_dir" => evergreen.to_s }
+      data: { "version" => 1, "src_dir" => evergreen.to_s }
     )
-    state = SpaceCadet::State.new(env: setup.fetch(:env))
-    store = SpaceCadet::SpaceStore.new(config: config, state: state, now: -> { fixed_time })
-    space = store.create("Evergreen")
-    git_client = TrackingGitClient.new
+    state = Space::Core::State.new(env: setup.fetch(:env))
+    store = Space::Core::SpaceStore.new(config: config, state: state, now: -> { fixed_time })
+    space = store.create("Evergreen").value!
+    fake_scm = TrackingSCM.new
+    fake_cloner = TrackingCloner.new
 
     store.add_repos_to(
       space,
       ["example-tools/present", "example-tools/absent"],
-      git_client: git_client,
+      scm: fake_scm,
+      cloner: fake_cloner,
       mise_client: TrackingMiseClient.new
     )
 
-    assert_equal [evergreen.join("github.com", "example-tools", "present").to_s], git_client.copied_sources
-    assert_equal ["git@github.com:example-tools/absent.git"], git_client.cloned_urls
+    assert_equal 1, fake_cloner.calls.length
+    assert_equal "github.com/example-tools/present", fake_cloner.calls.first[:name]
+    assert_equal ["git@github.com:example-tools/absent.git"], fake_scm.cloned_urls
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
   end
 
-  class TrackingGitClient
-    attr_reader :max_active, :clone_count, :cloned_urls, :copied_sources
+  def test_failing_clone_returns_failure_with_clean_git_error_without_async_noise
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Fail Space", git: false).value!
 
-    def initialize
+    old_stderr = $stderr
+    captured = StringIO.new
+    $stderr = captured
+
+    result = store.add_repos_to(space, ["example-tools/bad"],
+                                scm: FailingSCM.new,
+                                mise_client: TrackingMiseClient.new)
+
+    $stderr = old_stderr
+    assert result.failure?
+    assert_kind_of Space::Core::GitError, result.failure
+    assert_match(/clone failed/, result.failure.message)
+    refute_match(/Task may have ended with unhandled exception/, captured.string)
+    refute_match(/"severity":"warn"/, captured.string)
+  ensure
+    $stderr = old_stderr if old_stderr
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_add_repos_via_real_engine_copies_evergreen_checkout
+    setup = temp_env
+    evergreen = Pathname.new(setup.fetch(:root)).join("evergreen")
+    repo_src = evergreen.join("github.com", "test-owner", "test-repo")
+    FileUtils.mkdir_p(repo_src)
+
+    git_env = {
+      "GIT_AUTHOR_NAME" => "Test", "GIT_AUTHOR_EMAIL" => "test@example.com",
+      "GIT_COMMITTER_NAME" => "Test", "GIT_COMMITTER_EMAIL" => "test@example.com"
+    }
+    system("git", "-C", repo_src.to_s, "init", out: File::NULL, err: File::NULL)
+    system(git_env, "git", "-C", repo_src.to_s, "commit", "--allow-empty", "-m", "init",
+           out: File::NULL, err: File::NULL)
+
+    config = Space::Core::Config.new(
+      env: setup.fetch(:env),
+      data: { "version" => 1, "src_dir" => evergreen.to_s }
+    )
+    state = Space::Core::State.new(env: setup.fetch(:env))
+    store = Space::Core::SpaceStore.new(config: config, state: state, now: -> { fixed_time })
+    space = store.create("Real Engine Test", git: false).value!
+
+    store.add_repos_to(space, ["test-owner/test-repo"], mise_client: TrackingMiseClient.new)
+
+    assert_path_exists space.path.join("repos", "test-repo", ".git")
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_add_repos_to_returns_failure_on_duplicate_destination
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Dup Space", git: false).value!
+
+    result = store.add_repos_to(space, ["foo/dup", "foo/dup"],
+                                scm: TrackingSCM.new,
+                                mise_client: TrackingMiseClient.new)
+
+    assert result.failure?
+    assert_kind_of Space::Core::RepoExistsError, result.failure
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  def test_provision_scripts_returns_list_when_pack_provision_present
+    space = Space::Core::Space.new(
+      Dir.mktmpdir,
+      { "pack" => { "provision" => ["scripts/install.sh", "scripts/setup.sh"] } }
+    )
+
+    assert_equal ["scripts/install.sh", "scripts/setup.sh"], space.provision_scripts
+  end
+
+  def test_provision_scripts_returns_empty_array_when_pack_key_absent
+    space = Space::Core::Space.new(Dir.mktmpdir, { "id" => "x", "title" => "x" })
+
+    assert_equal [], space.provision_scripts
+  end
+
+  def test_provision_scripts_returns_empty_array_when_provision_is_empty_list
+    space = Space::Core::Space.new(Dir.mktmpdir, { "pack" => { "provision" => [] } })
+
+    assert_equal [], space.provision_scripts
+  end
+
+  def test_persist_paths_returns_list_when_pack_persist_present
+    space = Space::Core::Space.new(
+      Dir.mktmpdir,
+      { "pack" => { "persist" => ["/root/.hermes", "/root/.config"] } }
+    )
+
+    assert_equal ["/root/.hermes", "/root/.config"], space.persist_paths
+  end
+
+  def test_persist_paths_returns_empty_array_when_pack_key_absent
+    space = Space::Core::Space.new(Dir.mktmpdir, { "id" => "x", "title" => "x" })
+
+    assert_equal [], space.persist_paths
+  end
+
+  def test_persist_paths_returns_empty_array_when_persist_is_empty_list
+    space = Space::Core::Space.new(Dir.mktmpdir, { "pack" => { "persist" => [] } })
+
+    assert_equal [], space.persist_paths
+  end
+
+  def test_current_returns_failure_on_corrupt_metadata
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    corrupt_dir = File.join(setup[:root], "corrupt-space")
+    FileUtils.mkdir_p(corrupt_dir)
+    File.write(File.join(corrupt_dir, Space::Core::Space::METADATA_FILE), "just a string\n")
+
+    result = store.current(from: corrupt_dir)
+
+    assert result.failure?
+    assert_kind_of Space::Core::Error, result.failure
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  class FailingSCM
+    include Dry::Monads[:result]
+
+    def clone(url, dest)
+      Failure({url: url, dest: dest, stderr: "connection refused"})
+    end
+  end
+
+  class TrackingSCM
+    include Dry::Monads[:result]
+
+    attr_reader :max_active, :clone_count, :cloned_urls
+
+    # Bounds #wait_for_rendezvous. Dispatch is greedy (Async::Task#async runs the task
+    # body immediately), so under the semaphore's current behavior the rendezvous
+    # resolves in well under a second; this only needs to be generous enough to never
+    # trip on a healthy run while still failing the suite instead of hanging it if a
+    # scheduling change ever stops driving concurrency to `target`.
+    RENDEZVOUS_TIMEOUT = 5
+
+    # With `target` set, #clone rendezvouses: it blocks until `target` clones are
+    # simultaneously active before any of them may proceed, so a caller that drives
+    # concurrency up to `target` proves that deterministically instead of by the luck
+    # of sleep-timed scheduling. Without `target`, #clone just sleeps briefly, for
+    # callers that only care that clones happened, not how concurrently.
+    def initialize(target: nil)
       @active = 0
       @max_active = 0
       @clone_count = 0
       @cloned_urls = []
-      @copied_sources = []
+      @target = target
+      @rendezvous = Async::Condition.new
     end
 
-    def clone(url, path)
+    def clone(url, dest)
       @active += 1
       @clone_count += 1
       @cloned_urls << url
-      @max_active = [max_active, @active].max
-      sleep 0.01
-      FileUtils.mkdir_p(Pathname.new(path).join(".git"))
+      @max_active = [@max_active, @active].max
+      @target ? wait_for_rendezvous : sleep(0.01)
+      FileUtils.mkdir_p(File.join(dest, ".git"))
+      Success(dest)
     ensure
       @active -= 1
     end
 
-    def copy(source, path)
-      @copied_sources << source.to_s
-      FileUtils.mkdir_p(Pathname.new(path).join(".git"))
+    private
+
+    def wait_for_rendezvous
+      return @rendezvous.signal if @active >= @target
+
+      Async::Task.current.with_timeout(
+        RENDEZVOUS_TIMEOUT, RuntimeError,
+        "TrackingSCM rendezvous timed out after #{RENDEZVOUS_TIMEOUT}s: never reached " \
+        "#{@target} simultaneously active clones (max_active reached was #{@max_active})"
+      ) { @rendezvous.wait }
+    end
+  end
+
+  class TrackingCloner
+    include Dry::Monads[:result]
+
+    attr_reader :calls
+
+    def initialize
+      @calls = []
+    end
+
+    def call(name:, into:)
+      @calls << {name: name, into: into}
+      dest = File.join(into, File.basename(name))
+      FileUtils.mkdir_p(File.join(dest, ".git"))
+      Success(dest)
     end
   end
 
