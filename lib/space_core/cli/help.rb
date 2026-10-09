@@ -26,6 +26,22 @@ module Space::Core::CLI
     }.freeze
     DEFAULT_TAGLINE = TAGLINES.fetch("space")
 
+    # Product identity for the root header — defaults to this gem (the `space`
+    # binary). A host binary sharing this renderer (the `architect` binary) sets
+    # its own name and version so its help is branded by the host, not the
+    # substrate; both stay unset for `space`.
+    def self.product_name = @product_name || "space-cadet"
+
+    def self.product_name=(name)
+      @product_name = name
+    end
+
+    def self.product_version = @product_version || Space::Core::VERSION
+
+    def self.product_version=(version)
+      @product_version = version
+    end
+
     module_function
 
     # Header for the trailing group of children that declare no phase. Left nil
@@ -59,7 +75,7 @@ module Space::Core::CLI
     def header(result, pastel)
       return unless result.names.empty?
 
-      "#{pastel.bold.cyan("space-cadet")} #{pastel.dim(Space::Core::VERSION)} " \
+      "#{pastel.bold.cyan(product_name)} #{pastel.dim(product_version)} " \
         "#{pastel.dim("— #{tagline}")}\n"
     end
 
