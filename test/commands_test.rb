@@ -1,0 +1,104 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "open3"
+
+class CoreCommandsTest < Space::CoreTest
+  def test_short_command_passthrough
+    assert_equal "cd ~/path", Space::Core::Commands.wrap("cd ~/path")
+  end
+
+  def test_short_flag_command_passthrough
+    assert_equal "git push -u origin branch", Space::Core::Commands.wrap("git push -u origin branch")
+  end
+
+  def test_wraps_at_double_dash_flag_boundaries
+    result = Space::Core::Commands.wrap(%(gh pr create --base main --head slug --title "T" --body-file ~/f))
+    lines = result.split("\n")
+    assert_equal 5, lines.size
+    assert_equal %(gh pr create \\), lines[0]
+    assert_equal %(  --base main \\), lines[1]
+    assert_equal %(  --head slug \\), lines[2]
+    assert_equal %(  --title "T" \\), lines[3]
+    assert_equal "  --body-file ~/f", lines[4]
+  end
+
+  def test_continuation_lines_have_two_space_indent
+    result = Space::Core::Commands.wrap("gh pr create --base main --body-file ~/f")
+    result.split("\n")[1..].each { |l| assert_match(/\A  /, l) }
+  end
+
+  def test_all_but_last_continuation_line_ends_with_backslash
+    result = Space::Core::Commands.wrap("gh pr create --base main --head slug --body-file ~/f")
+    lines = result.split("\n")
+    lines[0..-2].each { |l| assert_match(/ \\$/, l) }
+    refute_match(/ \\$/, lines.last)
+  end
+
+  def test_short_flag_stays_on_base_line
+    result = Space::Core::Commands.wrap("gh issue create -R org/repo --title \"T\" --body-file ~/f")
+    lines = result.split("\n")
+    assert_match(/\Agh issue create -R org\/repo \\/, lines[0])
+    assert_equal "  --title \"T\" \\", lines[1]
+    assert_equal "  --body-file ~/f", lines[2]
+  end
+
+  def test_wrapped_output_is_bash_n_valid
+    result = Space::Core::Commands.wrap(
+      %(gh pr create --base main --head project/slug --title "Space Title" --body-file ~/path/to/file.md)
+    )
+    _out, _err, status = Open3.capture3("bash", "-n", stdin_data: result)
+    assert status.success?, "wrapped command must pass bash -n"
+  end
+
+  def test_single_flag_command_wraps
+    result = Space::Core::Commands.wrap("gh pr create --base main")
+    lines = result.split("\n")
+    assert_equal 2, lines.size
+    assert_equal "gh pr create \\", lines[0]
+    assert_equal "  --base main", lines[1]
+  end
+
+  def test_wrap_preserves_double_quoted_value_containing_double_dash_at_argv_level
+    cmd = Space::Core::Commands.wrap(%(printargs -R org/repo --title "dispatch -- lane fails" --body-file ~/f))
+    script = %(printargs() { for a in "$@"; do printf "[%s]\n" "$a"; done; }) + "\n" + cmd
+    out, _err, status = Open3.capture3("bash", "-c", script)
+    assert status.success?
+    assert_includes out, "[dispatch -- lane fails]\n"
+  end
+
+  def test_wrap_preserves_single_quoted_value_containing_double_dash_at_argv_level
+    cmd = Space::Core::Commands.wrap(%(printargs -R org/repo --title 'dispatch -- lane fails' --body-file ~/f))
+    script = %(printargs() { for a in "$@"; do printf "[%s]\n" "$a"; done; }) + "\n" + cmd
+    out, _err, status = Open3.capture3("bash", "-c", script)
+    assert status.success?
+    assert_includes out, "[dispatch -- lane fails]\n"
+  end
+
+  # AC3: wrapping never changes argv. bash is the oracle: run the raw command
+  # and the wrapped command through the same script and compare argv, not the
+  # rendered string a wrapped command that merely passes `bash -n` can still
+  # desync mid-argument.
+  def test_wrap_preserves_argv_across_a_battery_of_commands
+    printargs = %(printargs() { for a in "$@"; do printf "[%s]\n" "$a"; done; })
+    commands = [
+      %(printargs -R o/r --title "plain -- here" --body-file ~/f),
+      %(printargs -R o/r --title "odd \\" quote -- tail" --body-file ~/f),
+      %(printargs -R o/r --title "two \\" q \\" here -- tail" --body-file ~/f),
+      %(printargs -R o/r --title 'single -- quoted' --body-file ~/f),
+      %(printargs -R o/r --title 'back\\slash -- in single' --body-file ~/f),
+      %(printargs -R o/r --title "dollar $x -- tail" --body-file ~/f),
+      %(printargs --only one),
+      %(printargs -R o/r --a "x" --b "y -- z" --c "w")
+    ]
+
+    commands.each do |cmd|
+      raw_out, _raw_err, raw_status = Open3.capture3("bash", "-c", "#{printargs}\n#{cmd}")
+      wrapped_out, _wrapped_err, wrapped_status = Open3.capture3("bash", "-c", "#{printargs}\n#{Space::Core::Commands.wrap(cmd)}")
+
+      assert raw_status.success?, "raw command failed: #{cmd}"
+      assert wrapped_status.success?, "wrapped command failed: #{cmd}"
+      assert_equal raw_out, wrapped_out, "wrap changed argv for: #{cmd}"
+    end
+  end
+end
