@@ -1,7 +1,11 @@
-# Releasing
+# Release a new version 🚢
 
-Releases happen when the human lands work: one release commit, one signed tag —
-automation does the rest.
+> **Maintainer-facing.** This is the release checklist for maintainers of the
+> `space-cadet` gem itself — if you use the `space` binary, nothing here
+> applies to you. Everyone else: see the [how-to index](README.md).
+
+How to land a release: one release commit, one signed tag — automation does
+the rest.
 
 Where things live:
 
