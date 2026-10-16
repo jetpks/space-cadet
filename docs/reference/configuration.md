@@ -47,6 +47,16 @@ Only these six keys are editable via `space config set KEY VALUE`
 unknown key fails with the accepted list. Setting `git_clone_protocol` to
 anything but `ssh` or `https` fails at both set time and read time.
 
+### ssh clones run non-interactively
+
+Whichever protocol `git_clone_protocol` selects, network clones never
+prompt: ssh always runs with `BatchMode=yes` (options appended after any
+inherited `GIT_SSH_COMMAND`), so an unknown host key fails fast — with
+guidance — instead of hanging the command on ssh's yes/no prompt. See
+[`space repo add --trust-host-key` in the CLI reference](cli.md) for the
+TOFU flag (first-contact keys accepted, changed keys still fail) and the
+idempotent add semantics.
+
 ### Derived values
 
 `spaces_dir` and `src_dir` default dynamically from `base_dir`: unset keys
