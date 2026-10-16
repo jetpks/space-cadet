@@ -122,16 +122,22 @@ module Space::Core
 
     def add_repos_to(space, specs, scm: SCM::Git.new, cloner: nil, mise_client: MiseClient.new, reporter: nil)
       additions = prepare_repo_additions(space, specs)
+      # :present additions (already tracked) do no work at all; mark them
+      # done for the reporter so progress counts every spec without ever
+      # claiming a fetch for one.
+      additions.each { |addition| reporter&.skip(addition) if addition.fetch(:outcome) == :present }
       first_error = nil
 
       Async do |task|
         semaphore = Async::Semaphore.new(MAX_CONCURRENT_CLONES, parent: task)
 
         clone_tasks = additions.map do |addition|
+          next if addition.fetch(:outcome) == :present
+
           semaphore.async(finished: false) do
             clone_addition(addition, scm:, cloner:, mise_client:, reporter:)
           end
-        end
+        end.compact
 
         # Collect results without raising inside the reactor so the outer task
         # succeeds and async does not log "Task may have ended" for our errors.
@@ -145,8 +151,16 @@ module Space::Core
       return Failure(first_error) if first_error
 
       Success(additions.map do |addition|
-        repo_data = space.add_repo(addition.fetch(:reference), relative_path: addition.fetch(:relative_path), now: now.call)
-        { space: space, repo: repo_data, reference: addition.fetch(:reference), path: addition.fetch(:path) }
+        outcome = addition.fetch(:outcome)
+        repo_data =
+          if outcome == :present
+            # Already tracked: report the existing entry as-is — registration
+            # is not re-run (Space#add_repo's guard would rightly refuse).
+            addition.fetch(:existing_repo)
+          else
+            space.add_repo(addition.fetch(:reference), relative_path: addition.fetch(:relative_path), now: now.call)
+          end
+        { space: space, repo: repo_data, reference: addition.fetch(:reference), path: addition.fetch(:path), outcome: outcome }
       end)
     rescue Error => e
       Failure(e)
@@ -160,7 +174,9 @@ module Space::Core
 
     def clone_addition(addition, scm:, cloner:, mise_client:, reporter: nil)
       reporter&.start(addition)
-      fetch_addition(addition, scm:, cloner:)
+      # :adopted checkouts are already on disk — no fetch of any kind (no
+      # scm.clone, no Cloner call); only trust + registration remain.
+      fetch_addition(addition, scm:, cloner:) unless addition.fetch(:outcome) == :adopted
       reporter&.trust(addition)
       mise_client.trust(addition.fetch(:path))
       reporter&.finish(addition)
@@ -183,7 +199,19 @@ module Space::Core
         raise GitError, "clone failed (copy): #{result.failure}" if result.failure?
       else
         result = scm.clone(reference.clone_url, destination.to_s)
-        raise GitError, "clone failed: #{result.failure[:stderr]}" if result.failure?
+        return if result.success?
+
+        stderr = result.failure[:stderr]
+        message = "clone failed: #{stderr}"
+        # OpenSSH does not localize "Host key verification failed", so it is
+        # a stable trigger. Any other failure surfaces the raw stderr as
+        # before — fail-fast without a forward path is a support ticket, so
+        # teach the flag right where the operator will be looking.
+        if stderr.to_s.include?("Host key verification failed")
+          message += "\nHost key not in known_hosts; re-run with --trust-host-key to accept it on first contact, " \
+                     "or add it to your known_hosts manually."
+        end
+        raise GitError, message
       end
     end
 
@@ -194,13 +222,15 @@ module Space::Core
         relative_path = Pathname.new("repos").join(reference.directory_name)
         destination = space.path.join(relative_path)
 
-        ensure_repo_can_be_added!(space, reference, relative_path, destination)
+        outcome, existing_repo = ensure_repo_can_be_added!(space, reference, relative_path, destination)
 
         {
           reference: reference,
           relative_path: relative_path,
           path: destination,
-          src_source: src_dir && reference.src_path(src_dir)
+          src_source: src_dir && reference.src_path(src_dir),
+          outcome: outcome,
+          existing_repo: existing_repo
         }
       end
 
@@ -216,17 +246,36 @@ module Space::Core
       additions
     end
 
+    # Classify one resolved spec for the idempotent-add contract:
+    #   :added   — fetch (COW copy when an evergreen src exists, else
+    #              clone), then trust, then register (today's path);
+    #   :present — same full_name already tracked: skip fetch, trust, and
+    #              registration entirely (no-op success, whether or not the
+    #              directory is on disk — tracked ⇒ skip);
+    #   :adopted — destination exists on disk with .git, untracked: trust +
+    #              register, NO fetch (heals the orphaned checkouts a failed
+    #              batch leaves behind).
+    # Refusals (RepoExistsError): a tracked repo matching on path or name
+    # with a DIFFERENT full_name is a conflict, not idempotency, and a
+    # destination that exists without .git is not ours to register.
     def ensure_repo_can_be_added!(space, reference, relative_path, destination)
-      raise RepoExistsError, "Repo destination already exists: #{destination}" if destination.exist?
+      existing = space.repos.find { |repo| repo["full_name"] == reference.full_name }
+      return :present, existing if existing
 
-      existing = space.repos.find do |repo|
-        repo["full_name"] == reference.full_name ||
-          repo["path"] == relative_path.to_s ||
-          repo["name"] == reference.name
+      conflicting = space.repos.find do |repo|
+        repo["path"] == relative_path.to_s || repo["name"] == reference.name
       end
-      return unless existing
+      raise RepoExistsError, "Repo '#{reference.full_name}' already exists in #{space.id}" if conflicting
 
-      raise RepoExistsError, "Repo '#{reference.full_name}' already exists in #{space.id}"
+      if destination.exist?
+        unless destination.join(".git").exist?
+          raise RepoExistsError, "Repo destination already exists and is not a git repository: #{destination}"
+        end
+
+        return :adopted, nil
+      end
+
+      [:added, nil]
     end
 
     def metadata_for(id:, title:, timestamp:)

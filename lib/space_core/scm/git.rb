@@ -11,6 +11,17 @@ module Space::Core
     # Git CLI implementation of SCM::Client. All subprocess work is
     # delegated to Shell.run (which requires an ambient Async::Task).
     class Git < Client
+      # trust_host_key: append `-o StrictHostKeyChecking=accept-new` to the
+      # ssh command clones run under (TOFU: first-contact host keys are
+      # accepted automatically, changed keys still fail verification). The
+      # default (false) keeps strict host key checking. Host key
+      # verification is never disabled outright — the operator's "just
+      # disable it" urge is met with the strictly safer accept-new shape,
+      # opt-in only.
+      def initialize(trust_host_key: false)
+        @trust_host_key = trust_host_key
+      end
+
       # Resolve the bare remote's HEAD. First try the local
       # `origin/HEAD` symbolic ref; if missing/stale, do a one-shot
       # `git remote set-head origin -a` (network) to refresh it, then
@@ -107,10 +118,18 @@ module Space::Core
         Dry::Monads::Success(parsed)
       end
 
+      # Every clone runs ssh non-interactively. Open3.capture3 drains the
+      # child's stdout/stderr pipes, but ssh opens the controlling terminal
+      # (/dev/tty) directly for its host-key/passphrase/password prompts, so
+      # without BatchMode=yes a first-contact ssh clone hangs forever behind
+      # the CLI spinner. GIT_SSH_COMMAND makes every ssh prompt fail fast
+      # instead; git ignores it for https URLs, so it is set unconditionally
+      # — no URL-scheme conditional. An inherited GIT_SSH_COMMAND is honored
+      # with our options appended after it (assumed ssh-compatible).
       def clone(url, dest)
         parent = File.dirname(dest)
         FileUtils.mkdir_p(parent)
-        result = Shell.run("git", "clone", url, dest)
+        result = Shell.run("git", "clone", url, dest, env: {"GIT_SSH_COMMAND" => git_ssh_command})
         if result.success?
           Dry::Monads::Success(dest)
         else
@@ -164,6 +183,15 @@ module Space::Core
       end
 
       private
+
+      # Computed at clone time from the in-process ENV so callers may set
+      # GIT_SSH_COMMAND after this SCM was constructed. An unset or blank
+      # inherited value degrades to plain "ssh".
+      def git_ssh_command
+        base = ENV["GIT_SSH_COMMAND"].to_s.strip.empty? ? "ssh" : ENV["GIT_SSH_COMMAND"]
+        trust_args = @trust_host_key ? ["-o", "StrictHostKeyChecking=accept-new"] : []
+        [base, "-o", "BatchMode=yes", *trust_args].join(" ")
+      end
 
       # `git symbolic-ref --short refs/remotes/origin/HEAD` returns
       # `origin/<branch>` (the short form of `refs/remotes/origin/<branch>`);

@@ -48,12 +48,18 @@ Usage: space new TITLE
   -r, --repo=REPO   Repo ref to clone (repeatable: pass -r once per repo;
                     the comma form `-r a,b` also works)
   --[no-]git        Initialize the space as a Git repository (default)
+  --[no-]trust-host-key
+                    Accept unknown ssh host keys on first contact (default:
+                    false; changed keys still fail)
 ```
 
 The id is date-prefixed and slugged from the title (`"Name of Space"` →
 `20260531-name-of-space`); duplicate names on the same day get a counter
 (`…-name-of-space-2`). Repos are provisioned into `repos/` immediately —
 copy-on-write from an evergreen checkout when available, else cloned.
+`-r` adds get exactly the same semantics as `space repo add`, including
+idempotent classification (see [`space repo add`](#space-repo-subcommand-alias-namespace-space-repos)) and the
+`--[no-]trust-host-key` ssh behavior below.
 
 Examples from `--help`:
 
@@ -159,6 +165,7 @@ Manage repos in the current space. `space repos …` dispatches identically to
 
 ```text
 Usage: space repo add [REPOS]      # Add repos to the current space (copy-on-write from an evergreen checkout when available, else clone)
+  --[no-]trust-host-key            # Accept unknown ssh host keys on first contact (changed keys still fail)
 Usage: space repo list             # List repos in the current space (alias: space repo ls)
 Usage: space repo resolve [REPOS]  # Resolve repo refs without cloning
 ```
@@ -166,6 +173,57 @@ Usage: space repo resolve [REPOS]  # Resolve repo refs without cloning
 - **`space repo add REPO [REPO…]`** — add repos into `repos/` and track them
   in `space.yaml`; multiple repos are fetched concurrently, up to five at a
   time. After each repo lands, `mise trust` runs in it.
+
+  **Adds are idempotent.** Each repo spec is classified before anything is
+  fetched, and each classification gets its own success line (plus its
+  in-space path):
+
+  | Situation | Outcome | Line printed |
+  |---|---|---|
+  | Same repo (`full_name`) already tracked | skipped entirely — no clone, no `mise trust`, no new `space.yaml` entry, whether or not the directory is on disk | `Already present: <full_name>` |
+  | Destination directory exists, untracked, contains `.git` | adopted — `mise trust` runs, it is registered, **nothing is fetched** | `Registered existing checkout: <full_name>` |
+  | Destination directory exists without `.git` | refused | error naming the destination as not a git repository |
+  | Otherwise | fetched (copy-on-write when an evergreen checkout is available, else cloned), trusted, registered | `Added <full_name>` |
+
+  Adoption is what makes a corrected rerun work after a partially-failed
+  batch: a sibling's clone that already landed on disk is registered on the
+  next attempt instead of erroring with "destination already exists" — and
+  it is never cloned a second time. A spec colliding with a *different*
+  tracked repo (same in-space path or repo name) still fails with
+  `RepoExistsError`, and duplicate specs in one invocation still error.
+  Registration stays all-or-nothing: if any fetch fails, the command exits
+  non-zero and registers nothing — re-run it, and what did land is adopted.
+
+  **ssh clones never prompt.** Every network clone runs the child with
+  `GIT_SSH_COMMAND` set to `<inherited GIT_SSH_COMMAND, or "ssh" when
+  unset/empty> -o BatchMode=yes` (the options are appended after an
+  inherited value, which is assumed ssh-compatible; https clones are
+  unaffected — git ignores `GIT_SSH_COMMAND` for them). Without this, a
+  first-contact ssh host key would open ssh's yes/no prompt on the
+  controlling terminal and hang behind the progress spinner forever;
+  BatchMode makes every ssh prompt (host key, passphrase, password) fail
+  fast instead.
+
+  `--[no-]trust-host-key` (default `no`) appends
+  `-o StrictHostKeyChecking=accept-new` for TOFU (trust-on-first-use)
+  semantics: first-contact host keys are accepted automatically, while
+  *changed* keys still fail verification (MITM protection retained).
+  `StrictHostKeyChecking=no` is never set. Using the flag prints a warning
+  to stderr before the fetch begins:
+
+  ```text
+  Warning: trusting unknown host keys on first contact (--trust-host-key); changed keys still fail verification.
+  ```
+
+  (The flag only affects network clones; copy-on-write provisioning never
+  touches ssh.) When a clone fails with `Host key verification failed`
+  (an unknown key without the flag, or a *changed* key with it), the
+  error surfaces the raw ssh stderr plus guidance:
+
+  ```text
+  Host key not in known_hosts; re-run with --trust-host-key to accept it on first contact, or add it to your known_hosts manually.
+  ```
+
 - **`space repo list`** — table of full name and in-space path; prints `No
   repos found in <id>` for an empty space.
 - **`space repo resolve REPO [REPO…]`** — print the resolved full name and
