@@ -50,13 +50,19 @@ git ls-remote --tags origin | grep vX.Y.Z  # tag is on the remote
 trusted publishing (OIDC — no API token), smoke-tests an install from the
 live index, and creates the GitHub Release with generated notes and the
 `.gem` attached. Tags containing `.rc` / `.beta` / `.alpha` / `.pre` / `-`
-are marked prerelease and never become "latest". No manual step here — watch
-it land:
+are marked prerelease and never become "latest". No manual step on the gem
+side — watch it land:
 
 ```sh
 gh run watch
 gh release view vX.Y.Z
 ```
+
+The workflow also opens a version-bump PR against `jetpks/homebrew-tap` —
+`url` + `sha256` in `Formula/space-cadet.rb`, nothing else; prerelease tags
+skip it. That PR is the one manual step left: a human merges it after the
+tap's `brew test-bot` CI is green — never auto-merged — and that merge is
+what builds the bottles for `brew install jetpks/tap/space-cadet`.
 
 ## 4. Update the local CLI — and actually verify it
 
