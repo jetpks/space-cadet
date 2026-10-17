@@ -373,6 +373,206 @@ class CLITest < Space::CoreTest
     FileUtils.rm_rf(setup[:root]) if setup
   end
 
+  # The `problems` rerun story end to end: a batch failing on one repo leaves
+  # the sibling's clone on disk but registers nothing; the corrected rerun
+  # including that same repo adopts the orphaned checkout (no second clone)
+  # and clones only the new sibling.
+  def test_repo_add_partial_batch_failure_then_corrected_rerun_adopts_orphaned_checkout
+    setup = temp_env
+    env = setup.fetch(:env)
+    install_fake_git(setup)
+    misspelled_stderr = File.join(setup.fetch(:root), "misspelled-stderr.txt")
+    File.write(misspelled_stderr, "Cloning into 'repo-teender'...\nERROR: Repository not found.\nfatal: Could not read from remote repository.\n")
+    space_path = nil
+
+    with_env(env.merge(
+      "PATH" => "#{setup.fetch(:git_bin)}:#{ENV.fetch('PATH')}",
+      "PROJECT_SPACES_GIT_LOG" => setup.fetch(:git_log),
+      "PROJECT_SPACES_GIT_SSH_LOG" => setup.fetch(:git_ssh_log),
+      "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log),
+      "PROJECT_SPACES_CLONE_FAIL_URL" => "git@github.com:jetpks/repo-teender.git",
+      "PROJECT_SPACES_CLONE_FAIL_STDERR_FILE" => misspelled_stderr
+    )) do
+      out, = invoke("new", "Idempotent Space")
+      space_id = out[/Created (\d{8}-idempotent-space)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+      space_yaml = File.join(space_path, "space.yaml")
+
+      Dir.chdir(space_path) do
+        # cmd 1: the misspelled sibling fails; nothing is registered even
+        # though the good repo's clone already landed on disk.
+        _out, err = invoke("repo", "add", "github.com/jetpks/space-cadet", "github.com/jetpks/repo-teender")
+        assert_equal 1, Space::Core::CLI.last_outcome&.exit_code
+        assert_match(/Repository not found/, err)
+
+        metadata = YAML.safe_load(File.read(space_yaml), aliases: false)
+        assert_equal [], metadata.fetch("repos")
+        assert_path_exists File.join(space_path, "repos", "space-cadet", ".git")
+
+        # cmd 2: corrected rerun including the already-cloned repo.
+        out, err = invoke("repo", "add", "github.com/jetpks/space-cadet", "github.com/jetpks/repo-tender")
+        assert_empty err
+        assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+        assert_match("Registered existing checkout: github.com/jetpks/space-cadet", out)
+        assert_match("Added github.com/jetpks/repo-tender", out)
+        assert_match("~/architect/spaces/#{space_id}/repos/space-cadet", out)
+
+        cadet_clones = File.read(setup.fetch(:git_log)).split("\n")
+                                    .select { |line| line.include?("git@github.com:jetpks/space-cadet.git") }
+        assert_equal 1, cadet_clones.length, "orphaned checkout must be adopted, not cloned again"
+
+        metadata = YAML.safe_load(File.read(space_yaml), aliases: false)
+        assert_equal ["github.com/jetpks/space-cadet", "github.com/jetpks/repo-tender"].sort,
+                     metadata.fetch("repos").map { |repo| repo.fetch("full_name") }.sort
+      end
+    end
+  ensure
+    Dir.chdir("/") if space_path && Dir.pwd.start_with?(space_path)
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Re-adding a tracked repo is a no-op success: "Already present" line,
+  # exit 0, no new clone. Also pins the default ssh env: BatchMode=yes and
+  # never accept-new without the flag.
+  def test_repo_add_re_add_of_tracked_repo_is_already_present_without_cloning
+    setup = temp_env
+    env = setup.fetch(:env)
+    install_fake_git(setup)
+    space_path = nil
+
+    with_env(env.merge(
+      "PATH" => "#{setup.fetch(:git_bin)}:#{ENV.fetch('PATH')}",
+      "PROJECT_SPACES_GIT_LOG" => setup.fetch(:git_log),
+      "PROJECT_SPACES_GIT_SSH_LOG" => setup.fetch(:git_ssh_log),
+      "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log)
+    )) do
+      out, = invoke("new", "Present Space")
+      space_id = out[/Created (\d{8}-present-space)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+
+      Dir.chdir(space_path) do
+        _out, err = invoke("repo", "add", "example-tools/alpha")
+        assert_empty err
+        assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+        assert_equal ["ssh -o BatchMode=yes"], File.read(setup.fetch(:git_ssh_log)).split("\n")
+
+        out, err = invoke("repo", "add", "example-tools/alpha")
+        assert_empty err
+        assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+        assert_match("Already present: github.com/example-tools/alpha", out)
+        refute_match(/Added /, out)
+        assert_match("~/architect/spaces/#{space_id}/repos/alpha", out)
+
+        assert_equal 1, File.read(setup.fetch(:git_log)).split("\n").length, "no new clone for a present repo"
+
+        metadata = YAML.safe_load(File.read(File.join(space_path, "space.yaml")), aliases: false)
+        assert_equal ["github.com/example-tools/alpha"],
+                     metadata.fetch("repos").map { |repo| repo.fetch("full_name") }
+      end
+    end
+  ensure
+    Dir.chdir("/") if space_path && Dir.pwd.start_with?(space_path)
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # --trust-host-key: stderr warning naming the flag before the fetch, and
+  # accept-new appended to the ssh command in the recorded env.
+  def test_repo_add_trust_host_key_warns_and_uses_accept_new
+    setup = temp_env
+    env = setup.fetch(:env)
+    install_fake_git(setup)
+    space_path = nil
+
+    with_env(env.merge(
+      "PATH" => "#{setup.fetch(:git_bin)}:#{ENV.fetch('PATH')}",
+      "PROJECT_SPACES_GIT_LOG" => setup.fetch(:git_log),
+      "PROJECT_SPACES_GIT_SSH_LOG" => setup.fetch(:git_ssh_log),
+      "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log)
+    )) do
+      out, = invoke("new", "Trust Space")
+      space_id = out[/Created (\d{8}-trust-space)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+
+      Dir.chdir(space_path) do
+        out, err = invoke("repo", "add", "example-tools/alpha", "--trust-host-key")
+        assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+        assert_match(/--trust-host-key/, err)
+        assert_match(/unknown host keys on first contact/, err)
+        assert_match(/changed keys still fail/, err)
+        assert_equal ["ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"],
+                     File.read(setup.fetch(:git_ssh_log)).split("\n")
+        assert_match("Added github.com/example-tools/alpha", out)
+      end
+    end
+  ensure
+    Dir.chdir("/") if space_path && Dir.pwd.start_with?(space_path)
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # `space new -r … --trust-host-key` parity: same warning, same ssh env.
+  def test_new_trust_host_key_warns_and_uses_accept_new
+    setup = temp_env
+    env = setup.fetch(:env)
+    install_fake_git(setup)
+
+    with_env(env.merge(
+      "PATH" => "#{setup.fetch(:git_bin)}:#{ENV.fetch('PATH')}",
+      "PROJECT_SPACES_GIT_LOG" => setup.fetch(:git_log),
+      "PROJECT_SPACES_GIT_SSH_LOG" => setup.fetch(:git_ssh_log),
+      "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log)
+    )) do
+      out, err = invoke("new", "Trust New Space", "-r", "example-tools/alpha", "--trust-host-key")
+
+      assert_equal 0, Space::Core::CLI.last_outcome&.exit_code
+      assert_match(/--trust-host-key/, err)
+      assert_match(/changed keys still fail/, err)
+      assert_match("Added github.com/example-tools/alpha", out)
+      assert_equal ["ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"],
+                   File.read(setup.fetch(:git_ssh_log)).split("\n")
+    end
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # A clone failing with OpenSSH's host-key stderr exits 1 with the
+  # --trust-host-key / known_hosts guidance surfaced on stderr.
+  def test_repo_add_host_key_failure_surfaces_trust_guidance
+    setup = temp_env
+    env = setup.fetch(:env)
+    install_fake_git(setup)
+    hostkey_stderr = File.join(setup.fetch(:root), "hostkey-stderr.txt")
+    File.write(hostkey_stderr, "Host key verification failed.\nfatal: Could not read from remote repository.\n")
+    space_path = nil
+
+    with_env(env.merge(
+      "PATH" => "#{setup.fetch(:git_bin)}:#{ENV.fetch('PATH')}",
+      "PROJECT_SPACES_GIT_LOG" => setup.fetch(:git_log),
+      "PROJECT_SPACES_GIT_SSH_LOG" => setup.fetch(:git_ssh_log),
+      "PROJECT_SPACES_MISE_LOG" => setup.fetch(:mise_log),
+      "PROJECT_SPACES_CLONE_FAIL_URL" => "git@github.com:example-tools/locked.git",
+      "PROJECT_SPACES_CLONE_FAIL_STDERR_FILE" => hostkey_stderr
+    )) do
+      out, = invoke("new", "Host Key Space")
+      space_id = out[/Created (\d{8}-host-key-space)/, 1]
+      space_path = File.join(env["HOME"], "architect", "spaces", space_id)
+
+      Dir.chdir(space_path) do
+        out, err = invoke("repo", "add", "example-tools/locked")
+        assert_equal 1, Space::Core::CLI.last_outcome&.exit_code
+        assert_match(/Host key verification failed/, err)
+        assert_match(/--trust-host-key/, err)
+        assert_match(/known_hosts/, err)
+        refute_match(/Added /, out)
+
+        metadata = YAML.safe_load(File.read(File.join(space_path, "space.yaml")), aliases: false)
+        assert_equal [], metadata.fetch("repos")
+      end
+    end
+  ensure
+    Dir.chdir("/") if space_path && Dir.pwd.start_with?(space_path)
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
   def test_repo_resolve_uses_default_provider_without_cloning
     setup = temp_env
     env = setup.fetch(:env)
@@ -666,6 +866,13 @@ class CLITest < Space::CoreTest
 
   private
 
+  # Fake `git`/`mise` binaries for CLI-level stories. The fake git logs every
+  # clone's argv to $PROJECT_SPACES_GIT_LOG (format unchanged: one `"$*"` line
+  # per clone) and, when non-empty, the merged GIT_SSH_COMMAND to the
+  # SEPARATE $PROJECT_SPACES_GIT_SSH_LOG. A single clone URL can be made to
+  # fail (exit 1 + the stderr from a file) via $PROJECT_SPACES_CLONE_FAIL_URL
+  # + $PROJECT_SPACES_CLONE_FAIL_STDERR_FILE for the not-found and host-key
+  # stories.
   def install_fake_git(setup)
     git_bin = File.join(setup.fetch(:root), "bin")
     git_log = File.join(setup.fetch(:root), "git.log")
@@ -673,11 +880,18 @@ class CLITest < Space::CoreTest
     File.write(File.join(git_bin, "git"), <<~SH)
       #!/bin/sh
       if [ "$1" = "clone" ]; then
+        if [ -n "$PROJECT_SPACES_GIT_SSH_LOG" ] && [ -n "$GIT_SSH_COMMAND" ]; then
+          printf "%s\\n" "$GIT_SSH_COMMAND" >> "$PROJECT_SPACES_GIT_SSH_LOG"
+        fi
+        printf "%s\\n" "$*" >> "$PROJECT_SPACES_GIT_LOG"
+        if [ -n "$PROJECT_SPACES_CLONE_FAIL_URL" ] && [ "$2" = "$PROJECT_SPACES_CLONE_FAIL_URL" ]; then
+          cat "$PROJECT_SPACES_CLONE_FAIL_STDERR_FILE" >&2
+          exit 1
+        fi
         dest=""
         for arg in "$@"; do
           dest="$arg"
         done
-        printf "%s\\n" "$*" >> "$PROJECT_SPACES_GIT_LOG"
         mkdir -p "$dest/.git"
         exit 0
       fi
@@ -711,6 +925,7 @@ class CLITest < Space::CoreTest
 
     setup[:git_bin] = git_bin
     setup[:git_log] = git_log
+    setup[:git_ssh_log] = File.join(setup.fetch(:root), "git-ssh.log")
     setup[:mise_log] = File.join(setup.fetch(:root), "mise.log")
   end
 end

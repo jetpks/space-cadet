@@ -5,8 +5,10 @@ module Repo
   class Add < BaseCommand
     desc "Add repos to the current space (copy-on-write from an evergreen checkout when available, else clone)"
     argument :repos, type: :array, required: false, desc: "REPO [REPO...]"
+    option :trust_host_key, type: :boolean, default: false,
+                            desc: "Accept unknown ssh host keys on first contact (changed keys still fail)"
 
-    def call(repos: [], **opts)
+    def call(repos: [], trust_host_key: false, **opts)
       setup_terminal(**opts.slice(:color, :colors))
       handle_errors do
         specs = Array(repos).compact
@@ -16,13 +18,14 @@ module Repo
           next
         end
 
+        warn_trust_host_key if trust_host_key
         progress = RepoProgress.new(specs.length)
         add_result = terminal.with_spinner(-> { progress.message }) do
-          store.add_repos(specs, reporter: progress)
+          store.add_repos(specs, scm: Space::Core::SCM::Git.new(trust_host_key: trust_host_key), reporter: progress)
         end
         render(add_result) do |results|
           results.each do |result|
-            terminal.success "Added #{result.fetch(:repo).fetch('full_name')}"
+            terminal.success repo_addition_line(result)
             terminal.say terminal.path(result.fetch(:path))
           end
           CLI.record_outcome(Outcome.new(exit_code: 0))

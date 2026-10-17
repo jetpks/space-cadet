@@ -243,6 +243,9 @@ class SpaceStoreTest < Space::CoreTest
     assert result.failure?
     assert_kind_of Space::Core::GitError, result.failure
     assert_match(/clone failed/, result.failure.message)
+    # Non-host-key failures surface the raw stderr exactly as before — no
+    # --trust-host-key guidance for an unrelated reason.
+    refute_match(/--trust-host-key/, result.failure.message)
     refute_match(/Task may have ended with unhandled exception/, captured.string)
     refute_match(/"severity":"warn"/, captured.string)
   ensure
@@ -290,6 +293,199 @@ class SpaceStoreTest < Space::CoreTest
 
     assert result.failure?
     assert_kind_of Space::Core::RepoExistsError, result.failure
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Idempotent add: re-adding a tracked repo is a no-op success (:present) —
+  # no fetch, no trust, no re-registration; exactly one space.yaml entry.
+  def test_add_repos_re_add_of_tracked_repo_is_present_noop
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Idempotent Space", git: false).value!
+    fake_scm = TrackingSCM.new
+    mise_client = TrackingMiseClient.new
+
+    first = store.add_repos_to(space, ["example-tools/alpha"], scm: fake_scm, mise_client: mise_client)
+    assert first.success?
+
+    second = store.add_repos_to(space, ["example-tools/alpha"], scm: fake_scm, mise_client: mise_client)
+
+    assert second.success?
+    result = second.value!.first
+    assert_equal :present, result.fetch(:outcome)
+    assert_equal "github.com/example-tools/alpha", result.fetch(:repo).fetch("full_name")
+    assert_equal 1, fake_scm.clone_count, "present repo must not be cloned again"
+    assert_equal 1, mise_client.trust_count, "present repo must not be trusted again"
+
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
+    assert_equal 1, metadata.fetch("repos").length
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Present even when the directory is gone from disk: tracked means skip,
+  # regardless of disk state (re-provisioning is out of scope).
+  def test_add_repos_present_outranks_missing_directory
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Missing Dir Space", git: false).value!
+    fake_scm = TrackingSCM.new
+
+    store.add_repos_to(space, ["example-tools/alpha"], scm: fake_scm, mise_client: TrackingMiseClient.new)
+    FileUtils.rm_rf(space.path.join("repos", "alpha"))
+
+    result = store.add_repos_to(space, ["example-tools/alpha"], scm: fake_scm, mise_client: TrackingMiseClient.new)
+
+    assert result.success?
+    assert_equal :present, result.value!.first.fetch(:outcome)
+    assert_equal 1, fake_scm.clone_count, "tracked repo is never re-cloned, even with the dir deleted"
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Adoption: an untracked destination that already contains .git (the
+  # orphan a failed batch leaves behind) is trusted and registered with NO
+  # fetch — no scm.clone, no Cloner call.
+  def test_add_repos_adopts_existing_git_checkout_without_fetching
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Adopt Space", git: false).value!
+    FileUtils.mkdir_p(space.path.join("repos", "orphan", ".git"))
+    fake_scm = TrackingSCM.new
+    fake_cloner = TrackingCloner.new
+    mise_client = TrackingMiseClient.new
+
+    result = store.add_repos_to(space, ["example-tools/orphan"],
+                                scm: fake_scm, cloner: fake_cloner, mise_client: mise_client)
+
+    assert result.success?
+    added = result.value!.first
+    assert_equal :adopted, added.fetch(:outcome)
+    assert_equal "github.com/example-tools/orphan", added.fetch(:repo).fetch("full_name")
+    assert_equal 0, fake_scm.clone_count, "adopted checkout must not be cloned"
+    assert_empty fake_cloner.calls, "adopted checkout must not be copied"
+    assert_equal 1, mise_client.trust_count, "adopted checkout is still mise-trusted"
+
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
+    assert_equal ["repos/orphan"], metadata.fetch("repos").map { |repo| repo.fetch("path") }
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Adoption safety: an untracked destination WITHOUT .git — directory or
+  # plain file — is refused, not adopted; nothing is registered.
+  def test_add_repos_refuses_destination_that_is_not_a_git_repository
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Refuse Space", git: false).value!
+    FileUtils.mkdir_p(space.path.join("repos", "stray"))
+    File.write(space.path.join("repos", "plainfile"), "not a repo")
+
+    stray = store.add_repos_to(space, ["example-tools/stray"],
+                               scm: TrackingSCM.new, mise_client: TrackingMiseClient.new)
+    assert stray.failure?
+    assert_kind_of Space::Core::RepoExistsError, stray.failure
+    assert_match(/not a git repository/, stray.failure.message)
+    assert_match(space.path.join("repos", "stray").to_s, stray.failure.message)
+
+    plain = store.add_repos_to(space, ["example-tools/plainfile"],
+                               scm: TrackingSCM.new, mise_client: TrackingMiseClient.new)
+    assert plain.failure?
+    assert_kind_of Space::Core::RepoExistsError, plain.failure
+
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
+    assert_equal [], metadata.fetch("repos")
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Conflict, not idempotency: a tracked repo matching on path or name with
+  # a DIFFERENT full_name still fails with RepoExistsError (preserved).
+  def test_add_repos_name_collision_with_different_full_name_still_fails
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Conflict Space", git: false).value!
+    store.add_repos_to(space, ["example-tools/alpha"],
+                       scm: TrackingSCM.new, mise_client: TrackingMiseClient.new)
+
+    result = store.add_repos_to(space, ["other-org/alpha"],
+                                scm: TrackingSCM.new, mise_client: TrackingMiseClient.new)
+
+    assert result.failure?
+    assert_kind_of Space::Core::RepoExistsError, result.failure
+    assert_match(/already exists in #{space.id}/, result.failure.message)
+
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
+    assert_equal ["github.com/example-tools/alpha"], metadata.fetch("repos").map { |repo| repo.fetch("full_name") }
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Mixed batch: the tracked repo is skipped (:present), the new one is
+  # added (:added); each appears exactly once in space.yaml.
+  def test_add_repos_mixed_batch_skips_tracked_and_adds_new
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Mixed Space", git: false).value!
+    fake_scm = TrackingSCM.new
+    store.add_repos_to(space, ["example-tools/alpha"], scm: fake_scm, mise_client: TrackingMiseClient.new)
+
+    result = store.add_repos_to(space, ["example-tools/alpha", "example-tools/beta"],
+                                scm: fake_scm, mise_client: TrackingMiseClient.new)
+
+    assert result.success?
+    assert_equal %i[present added], result.value!.map { |r| r.fetch(:outcome) }
+    assert_equal 2, fake_scm.clone_count, "only the untracked repo is fetched"
+
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
+    assert_equal ["github.com/example-tools/alpha", "github.com/example-tools/beta"],
+                 metadata.fetch("repos").map { |repo| repo.fetch("full_name") }
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # All-or-nothing preserved: a failing clone fails the whole command even
+  # when a sibling would have been adopted; nothing is registered.
+  def test_add_repos_failure_with_adoptable_sibling_registers_nothing
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("All Or Nothing", git: false).value!
+    FileUtils.mkdir_p(space.path.join("repos", "orphan", ".git"))
+
+    result = store.add_repos_to(space, ["example-tools/orphan", "example-tools/bad"],
+                                scm: FailingSCM.new, mise_client: TrackingMiseClient.new)
+
+    assert result.failure?
+    assert_kind_of Space::Core::GitError, result.failure
+
+    metadata = YAML.safe_load(space.path.join("space.yaml").read, aliases: false)
+    assert_equal [], metadata.fetch("repos")
+  ensure
+    FileUtils.rm_rf(setup[:root]) if setup
+  end
+
+  # Host-key failures teach the flag: when the clone stderr contains OpenSSH's
+  # (unlocalized) "Host key verification failed", the surfaced error appends
+  # guidance naming --trust-host-key and known_hosts.
+  def test_clone_failure_with_host_key_verification_failed_appends_trust_guidance
+    setup = temp_env
+    store = build_store(env: setup.fetch(:env))
+    space = store.create("Host Key Space", git: false).value!
+
+    result = store.add_repos_to(
+      space,
+      ["example-tools/locked"],
+      scm: FailingSCM.new(stderr: "Host key verification failed.\nfatal: Could not read from remote repository.\n"),
+      mise_client: TrackingMiseClient.new
+    )
+
+    assert result.failure?
+    message = result.failure.message
+    assert_match(/clone failed/, message)
+    assert_match(/Host key verification failed/, message)
+    assert_match(/--trust-host-key/, message)
+    assert_match(/known_hosts/, message)
   ensure
     FileUtils.rm_rf(setup[:root]) if setup
   end
@@ -354,8 +550,12 @@ class SpaceStoreTest < Space::CoreTest
   class FailingSCM
     include Dry::Monads[:result]
 
+    def initialize(stderr: "connection refused")
+      @stderr = stderr
+    end
+
     def clone(url, dest)
-      Failure({url: url, dest: dest, stderr: "connection refused"})
+      Failure({url: url, dest: dest, stderr: @stderr})
     end
   end
 
