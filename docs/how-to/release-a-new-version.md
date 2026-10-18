@@ -14,6 +14,7 @@ Where things live:
 | The one version constant | `lib/space_core/version.rb` (`Space::Core::VERSION`; `space version` prints it) |
 | Changelog | `CHANGELOG.md` (Keep a Changelog; link refs at the bottom) |
 | Release automation | `.github/workflows/release.yml` (fires on `v*` tag push) |
+| Linux single-file binaries | `.github/workflows/linux-binaries.yml` (fires on the same `v*` tag push) |
 | Local install task | `Rakefile` → `rake install` (`gem install --user-install --no-document`) |
 
 ## 1. Release-prep commit
@@ -50,13 +51,27 @@ git ls-remote --tags origin | grep vX.Y.Z  # tag is on the remote
 trusted publishing (OIDC — no API token), smoke-tests an install from the
 live index, and creates the GitHub Release with generated notes and the
 `.gem` attached. Tags containing `.rc` / `.beta` / `.alpha` / `.pre` / `-`
-are marked prerelease and never become "latest". No manual step here — watch
-it land:
+are marked prerelease and never become "latest". No manual step on the gem
+side — watch it land:
 
 ```sh
 gh run watch
 gh release view vX.Y.Z
 ```
+
+The workflow also opens a version-bump PR against `jetpks/homebrew-tap` —
+`url` + `sha256` in `Formula/space-cadet.rb`, nothing else; prerelease tags
+skip it. That PR is the one manual step left: a human merges it after the
+tap's `brew test-bot` CI is green — never auto-merged — and that merge is
+what builds the bottles for `brew install jetpks/tap/space-cadet`.
+
+On the same tag push, `linux-binaries.yml` presses self-contained Linux
+binaries — one file per arch, `space-<version>-linux-x86_64.tar.gz` and
+`space-<version>-linux-arm64.tar.gz`, interpreter embedded (tebako v2.8.40,
+Ruby 4.0.5), pressed on the glibc 2.31 floor so they run on Ubuntu 20.04 and
+anything newer — and attaches each with a `.sha256` sidecar to the same
+GitHub Release. No manual step there either, and `workflow_dispatch` runs a
+dry press that attaches nothing.
 
 ## 4. Update the local CLI — and actually verify it
 

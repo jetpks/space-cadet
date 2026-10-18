@@ -1,0 +1,157 @@
+name: Linux binaries
+
+# Single-file Linux distribution for `space` (BRIEF "Channel decision"
+# item 3): tebako-pressed, self-contained (interpreter-embedded) binaries
+# for linux-gnu x86_64 + arm64, pressed inside ubuntu:20.04 so every
+# host-compiled byte (the io-event C extension in the async stack) links
+# against glibc 2.31 — the floor. The prebuilt tebako bootstrap and the
+# Ruby 4.0.5 runtime are built on the same floor upstream. Attaches
+# checksummed tarballs to the tag's GitHub Release (the one release.yml
+# creates). No Apple leg, ever (operator ruling 2026-10-17).
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch: # dry run: press + smoke both arches, attach nothing
+
+env:
+  # Pinned for reproducibility. install.sh verifies the downloaded
+  # binaries against the release's SHA256SUMS before installing.
+  # Bump deliberately (bus factor 1 upstream; releases days apart).
+  TEBAKO_VERSION: v2.8.40
+
+jobs:
+  press:
+    name: press linux-${{ matrix.tebako_arch }}
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:20.04 # glibc 2.31 floor — tebako's own release-build shape
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tebako_arch: x86_64
+            runner: ubuntu-latest
+          - tebako_arch: arm64 # aarch64; tebako release-asset suffix is arm64
+            runner: ubuntu-24.04-arm # free arm64 runner on a public repo
+    steps:
+      - name: Container toolchain (focal)
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential curl ca-certificates git
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install tebako (pinned, sha256-verified)
+        run: |
+          curl -fsSL https://tebako.org/install.sh | sh -s -- "$TEBAKO_VERSION"
+          "$HOME/.local/bin/tebako" --version
+
+      - name: Stage a Gemfile root (tebako's supported scenario)
+        run: |
+          # tebako 2.8.x supports a plain-Gemfile root only: a root *.gemspec
+          # trips the unsupported gem/gemspec scenario (press exit 130,
+          # "use a Gemfile root"). Stage the press root as a Gemfile app:
+          #  - Gemfile: resolves the gem's runtime deps through the compact
+          #    index at deploy time (they install into the image's gem dir)
+          #  - app/: this checkout's lib + gemspec, referenced as a path gem
+          #  - press-entry.rb: the entry. NOT the binstub: at package
+          #    runtime Bundler cannot be activated (eval_gemspec chdirs
+          #    into the path-gem dir and chdir into the package VFS is
+          #    unsupported by tebako 2.8.x on both macOS and linux-gnu),
+          #    and the deploy's bundle install has already installed the
+          #    deps into the image's gem dir, so plain RubyGems activation
+          #    resolves them.
+          mkdir -p press/app
+          cp -R lib space-cadet.gemspec press/app/
+          cat > press/Gemfile <<'GEMFILE'
+          source "https://rubygems.org"
+
+          gem "space-cadet", path: "app"
+          GEMFILE
+          cat > press/press-entry.rb <<'ENTRY'
+          # frozen_string_literal: true
+
+          $LOAD_PATH.unshift(File.expand_path("app/lib", __dir__))
+          require "space_core"
+
+          Space::Core::CLI.run(ARGV, $stdout, $stderr)
+          ENTRY
+
+      - name: Press space (self-contained, Ruby 4.0.5)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          tebako press -r press -e press-entry.rb -o out/space \
+            --mode self-contained --Ruby 4.0.5
+          test -x out/space
+
+      - name: Smoke - pressed binary prints this checkout's version
+        run: |
+          expected="$(sed -n 's/.*VERSION = "\(.*\)".*/\1/p' lib/space_core/version.rb)"
+          got="$(./out/space --version)"
+          echo "checkout: ${expected} / pressed: ${got}"
+          test "$got" = "$expected"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "$got" = "${GITHUB_REF_NAME#v}"
+          fi
+
+      - name: Package tarball + sha256 sidecar
+        run: |
+          version="$(sed -n 's/.*VERSION = "\(.*\)".*/\1/p' lib/space_core/version.rb)"
+          artifact="space-${version}-linux-${{ matrix.tebako_arch }}"
+          mkdir -p dist
+          tar -czf "dist/${artifact}.tar.gz" -C out space
+          (
+            cd dist
+            sha256sum "${artifact}.tar.gz" > "${artifact}.tar.gz.sha256"
+            sha256sum -c "${artifact}.tar.gz.sha256"
+          )
+          ls -l dist
+
+      - name: Upload pressed artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.tebako_arch }}
+          path: dist/*
+
+  attach:
+    name: attach binaries to the tag release
+    needs: press
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload release assets
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify sidecar checksums
+        run: cd dist && sha256sum -c ./*.sha256
+
+      - name: Wait for the release object (release.yml creates it)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if gh release view "${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            echo "release not up yet (attempt ${attempt}) - retrying in 30s"
+            sleep 30
+          done
+          echo "release ${GITHUB_REF_NAME} never appeared - did release.yml fail?" >&2
+          exit 1
+
+      - name: Attach tarballs + sidecars to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          # Mirror release.yml's prerelease marking; all v* tags attach.
+          prerelease: ${{ contains(github.ref_name, '.rc') || contains(github.ref_name, '.beta') || contains(github.ref_name, '.alpha') || contains(github.ref_name, '.pre') || contains(github.ref_name, '-') }}

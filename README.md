@@ -25,6 +25,38 @@ gem install space-cadet
 or add `gem "space-cadet"` to your `Gemfile` and `bundle install`. The gem
 installs one executable, `space`. 🎀
 
+`gem install` binds `space` to whichever Ruby is active — switch project
+Rubies and the binary follows (or breaks). Two channels sidestep that:
+
+### mise 🧰
+
+mise's `gem:` backend gives the tool its own Ruby and `GEM_HOME`, so it keeps
+working when a project switches Rubies:
+
+```sh
+mise use -g gem:space-cadet
+```
+
+One honest caveat: when the tool's own Ruby gets a minor-version bump, the
+installed gem needs a rebuild:
+
+```sh
+mise install --force gem:space-cadet
+```
+
+### Homebrew 🍺
+
+```sh
+brew install jetpks/tap/space-cadet
+```
+
+The `jetpks/tap` tap is auto-added — no separate `brew tap` step. The formula
+installs the gem on Homebrew's own Ruby, so it's immune to Ruby switches, and
+updates flow through `brew upgrade`.
+
+Pick by taste: Homebrew for macOS-first folks who don't manage Rubies, mise if
+you're already a mise user, plain `gem install` otherwise.
+
 ## 60-second start 🚀
 
 ```sh

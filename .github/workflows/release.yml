@@ -50,3 +50,58 @@ jobs:
           generate_release_notes: true
           # Prerelease tags (e.g. v2.0.0.rc1) must not be published as "latest".
           prerelease: ${{ contains(github.ref_name, '.rc') || contains(github.ref_name, '.beta') || contains(github.ref_name, '.alpha') || contains(github.ref_name, '.pre') || contains(github.ref_name, '-') }}
+
+      # Homebrew tap bump PR — BRIEF §"Channel decision" item 2. Requires the
+      # repository secret TAP_BUMP_TOKEN: a fine-grained PAT scoped to
+      # jetpks/homebrew-tap with Contents: read/write + Pull requests:
+      # read/write. Opens a version-bump PR (url + sha256 only) — NEVER
+      # merges; the tap's brew test-bot CI gates the merge, a human clicks it.
+      - name: Check out Homebrew tap
+        if: ${{ !(contains(github.ref_name, '.rc') || contains(github.ref_name, '.beta') || contains(github.ref_name, '.alpha') || contains(github.ref_name, '.pre') || contains(github.ref_name, '-')) }}
+        uses: actions/checkout@v7
+        with:
+          repository: jetpks/homebrew-tap
+          path: tap
+          token: ${{ secrets.TAP_BUMP_TOKEN }}
+
+      - name: Open Homebrew tap bump PR
+        if: ${{ !(contains(github.ref_name, '.rc') || contains(github.ref_name, '.beta') || contains(github.ref_name, '.alpha') || contains(github.ref_name, '.pre') || contains(github.ref_name, '-')) }}
+        env:
+          GEM_NAME: space-cadet
+          TAP_BUMP_TOKEN: ${{ secrets.TAP_BUMP_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          url="https://rubygems.org/downloads/${GEM_NAME}-${version}.gem"
+          sha256="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          test "${#sha256}" -eq 64
+          formula="Formula/${GEM_NAME}.rb"
+          cd tap
+          if grep -q "downloads/${GEM_NAME}-${version}.gem" "$formula"; then
+            echo "tap formula already at ${GEM_NAME} ${version} — nothing to bump"
+            exit 0
+          fi
+          branch="bump/${GEM_NAME}-${version}"
+          git config user.name  "jetpks release workflow"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -B "$branch"
+          sed -i -E \
+            -e "s|url \"https://rubygems.org/downloads/${GEM_NAME}-[^\"]*\\.gem\"|url \"${url}\"|" \
+            -e "s|sha256 \"[0-9a-f]{64}\"|sha256 \"${sha256}\"|" \
+            "$formula"
+          ruby -c "$formula"
+          grep -q "url \"${url}\"" "$formula"
+          grep -q "sha256 \"${sha256}\"" "$formula"
+          git add "$formula"
+          git commit -m "${GEM_NAME} ${version}"
+          git push --force origin "$branch"
+          open_prs="$(GH_TOKEN="${TAP_BUMP_TOKEN}" gh pr list --repo jetpks/homebrew-tap --head "$branch" --state open --json number --jq 'length')"
+          if [ "$open_prs" -eq 0 ]; then
+            GH_TOKEN="${TAP_BUMP_TOKEN}" gh pr create \
+              --repo jetpks/homebrew-tap \
+              --base main \
+              --head "$branch" \
+              --title "${GEM_NAME} ${version}" \
+              --body "Version bump opened by the ${GEM_NAME} release workflow. url + sha256 only. Merge after \`brew test-bot\` is green — never auto-merge."
+          else
+            echo "bump PR for ${branch} already open — branch force-refreshed"
+          fi
