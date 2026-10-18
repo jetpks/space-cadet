@@ -52,10 +52,29 @@ jobs:
           curl -fsSL https://tebako.org/install.sh | sh -s -- "$TEBAKO_VERSION"
           "$HOME/.local/bin/tebako" --version
 
+      - name: Stage a Gemfile root (tebako's supported scenario)
+        run: |
+          # tebako 2.8.x supports a plain-Gemfile root only: a root *.gemspec
+          # trips the unsupported gem/gemspec scenario (press exit 130,
+          # "use a Gemfile root"). Stage the press root as a Gemfile app:
+          #  - Gemfile: resolves the gem's runtime deps through the compact
+          #    index at deploy time (they install into the image's gem dir)
+          #  - app/: this checkout's lib + gemspec, referenced as a path gem
+          #  - exe/: the real binstub, adjacent to the Gemfile so its
+          #    bundler fallback activates the staged bundle at runtime
+          mkdir -p press/app press/exe
+          cp -R lib space-cadet.gemspec press/app/
+          cp exe/space press/exe/
+          cat > press/Gemfile <<'GEMFILE'
+          source "https://rubygems.org"
+
+          gem "space-cadet", path: "app"
+          GEMFILE
+
       - name: Press space (self-contained, Ruby 4.0.5)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          tebako press -r . -e exe/space -o out/space \
+          tebako press -r press -e exe/space -o out/space \
             --mode self-contained --Ruby 4.0.5
           test -x out/space
 
