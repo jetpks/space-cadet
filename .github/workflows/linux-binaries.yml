@@ -60,21 +60,33 @@ jobs:
           #  - Gemfile: resolves the gem's runtime deps through the compact
           #    index at deploy time (they install into the image's gem dir)
           #  - app/: this checkout's lib + gemspec, referenced as a path gem
-          #  - exe/: the real binstub, adjacent to the Gemfile so its
-          #    bundler fallback activates the staged bundle at runtime
-          mkdir -p press/app press/exe
+          #  - press-entry.rb: the entry. NOT the binstub: at package
+          #    runtime Bundler cannot be activated (eval_gemspec chdirs
+          #    into the path-gem dir and chdir into the package VFS is
+          #    unsupported by tebako 2.8.x on both macOS and linux-gnu),
+          #    and the deploy's bundle install has already installed the
+          #    deps into the image's gem dir, so plain RubyGems activation
+          #    resolves them.
+          mkdir -p press/app
           cp -R lib space-cadet.gemspec press/app/
-          cp exe/space press/exe/
           cat > press/Gemfile <<'GEMFILE'
           source "https://rubygems.org"
 
           gem "space-cadet", path: "app"
           GEMFILE
+          cat > press/press-entry.rb <<'ENTRY'
+          # frozen_string_literal: true
+
+          $LOAD_PATH.unshift(File.expand_path("app/lib", __dir__))
+          require "space_core"
+
+          Space::Core::CLI.run(ARGV, $stdout, $stderr)
+          ENTRY
 
       - name: Press space (self-contained, Ruby 4.0.5)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          tebako press -r press -e exe/space -o out/space \
+          tebako press -r press -e press-entry.rb -o out/space \
             --mode self-contained --Ruby 4.0.5
           test -x out/space
 
